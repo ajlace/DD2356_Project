@@ -24,7 +24,7 @@ struct Config config;
 int main(int argc, char* argv[])
 {
 	int opt, i;
-	int repeat = 1;
+	int repeat = REPEAT;
 	double startTime, endTime, runtimeMap, runtimeRed, runtime;
 	double avgRuntime = 0.0, 	prevAvgRuntime = 0.0, 	 sdRuntime = 0.0;
 	double avgRuntimeMap = 0.0, prevAvgRuntimeMap = 0.0, sdRuntimeMap = 0.0;
