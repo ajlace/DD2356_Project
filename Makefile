@@ -1,10 +1,10 @@
-CC = mpicc
+CC = cc
 SRC = $(wildcard src/*.c)
 OBJ = $(SRC:.c=.o)
 BIN = ./bin
 TARGET = mapRed.out
-CORES = 8
-TEST = ajla.txt
+CORES = 4
+TEST = wiki.txt
 HOSTS = hosts
 EXE = mpirun
 
@@ -22,7 +22,7 @@ ${BIN}:
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BIN)/$(TARGET): $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 run: all
 	$(EXE) -machinefile $(HOSTS) -np $(CORES) $(BIN)/$(TARGET) -f $(TEST)
