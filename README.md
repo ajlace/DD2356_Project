@@ -1,4 +1,4 @@
-# DD2356_Project
+# DD2356 MapReduce Project
 
 ## Git structure:
 * master branch: MPI implementation with non-blocking communication
