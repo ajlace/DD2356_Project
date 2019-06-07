@@ -266,7 +266,7 @@ void reduce()
 		addWord(config.finalTable, &config.sendVectors[config.rank].data[i]);
 	}
 	
-	//hashTablePrint(config.finalTable);
+	hashTablePrint(config.finalTable);
 }
 
 void error(int errCode, int line) 
