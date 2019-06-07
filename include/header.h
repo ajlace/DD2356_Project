@@ -14,9 +14,10 @@ typedef struct vector vector;
 
 #define MAX_WORD 15
 #define MASTER 0
-#define CHUNK 64
+#define CHUNK 5242880ULL
 #define USAGE_ERR 1
 #define REALLOC_ERR 2
+#define REPEAT 10
 
 typedef struct word {
         char data[MAX_WORD + 1];

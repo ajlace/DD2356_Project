@@ -1,15 +1,15 @@
-CC = mpicc
+CC = cc
 SRC = $(wildcard src/*.c)
 OBJ = $(SRC:.c=.o)
 BIN = ./bin
 TARGET = mapRed.out
-CORES = 8
-TEST = ajla.txt
+CORES = 4
+TEST = wiki.txt
 HOSTS = hosts
 EXE = mpirun
 
-LDFLAGS = -lm 
-CFLAGS = -I./include -g -Wall -O3
+LDFLAGS = -fopenmp -std=gnu11 -lm -O3
+CFLAGS = -I./include -fopenmp -std=gnu11 -g -Wall -O3
 
 all: dir $(BIN)/$(TARGET)
 
@@ -22,10 +22,11 @@ ${BIN}:
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BIN)/$(TARGET): $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 run: all
-	$(EXE) -machinefile $(HOSTS) -np $(CORES) $(BIN)/$(TARGET) -f $(TEST)
+	export OMP_NUM_THREADS=2
+	$(EXE) -machinefile $(HOSTS) -np $(CORES) $(BIN)/$(TARGET) -f $(TEST) > out.txt
 
 .PHONY: clean
 clean:

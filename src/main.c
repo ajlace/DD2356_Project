@@ -1,29 +1,35 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <math.h>
+#include <omp.h>
 #include <mpi.h>
 
 #include "header.h"
 
 struct Config {
-	int rank, rankSize, offset, nrOfChunks;
-	int* sendCounters;
-	int* recvCounters;
-	char* fInName;
+	int rank, rankSize;
+	unsigned long long fileReads, lastRead;
+	int *sendCounters, *recvCounters;
+	char *fInName;
 	MPI_File inFile;
-	hashTable* table;
-	hashTable* finalTable;
-	vector* sendVectors;
+	hashTable *table, *finalTable;
+	vector *sendVectors;
 	MPI_Datatype MPI_WORD;
 };
 
 struct Config config;
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
-	int opt;
+	int opt, i;
+	int repeat = REPEAT;
+	double startTime, endTime, runtimeMap, runtimeRed, runtime;
+	double avgRuntime = 0.0, 	prevAvgRuntime = 0.0, 	 sdRuntime = 0.0;
+	double avgRuntimeMap = 0.0, prevAvgRuntimeMap = 0.0, sdRuntimeMap = 0.0;
+	double avgRuntimeRed = 0.0, prevAvgRuntimeRed = 0.0, sdRuntimeRed = 0.0;
 
-	MPI_Init(&argc, &argv);
+	MPI_Init_thread(&argc, &argv, 2, &i);
 	MPI_Comm_rank(MPI_COMM_WORLD, &config.rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &config.rankSize);
 
@@ -42,10 +48,52 @@ int main(int argc, char* argv[])
 		}
 	}
 	
-	init();			// init all values
-	wordCount();	// do word count for input file
-	reduce();		// redistribute and reduce
-	cleanup();		// free all resources
+	for(i = 0; i < repeat; i++) {
+		init();			// init all values
+		MPI_Barrier(MPI_COMM_WORLD);
+		
+		startTime = MPI_Wtime();
+		wordCount();	// do word count for input file
+		MPI_Barrier(MPI_COMM_WORLD);
+		endTime = MPI_Wtime();
+				
+		runtimeMap = endTime - startTime;
+		prevAvgRuntimeMap = avgRuntimeMap;
+		avgRuntimeMap = avgRuntimeMap + (runtimeMap - avgRuntimeMap) / (i + 1);
+		sdRuntimeMap = sdRuntimeMap + (runtimeMap - avgRuntimeMap) * (runtimeMap - prevAvgRuntimeMap);
+		
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		startTime = MPI_Wtime();
+		reduce();		// redistribute and reduce
+		MPI_Barrier(MPI_COMM_WORLD);
+		endTime = MPI_Wtime();
+		
+		runtimeRed = endTime - startTime;
+		prevAvgRuntimeRed = avgRuntimeRed;
+		avgRuntimeRed = avgRuntimeRed + (runtimeRed - avgRuntimeRed) / (i + 1);
+		sdRuntimeRed = sdRuntimeRed + (runtimeRed - avgRuntimeRed) * (runtimeRed - prevAvgRuntimeRed);
+				
+		cleanup();		// free all resources
+		
+		runtime = runtimeMap + runtimeRed;
+		prevAvgRuntime = avgRuntime;
+		avgRuntime = avgRuntime + (runtime - avgRuntime) / (i + 1);
+		sdRuntime = sdRuntime + (runtime - avgRuntime) * (runtime - prevAvgRuntime);
+		
+		MPI_Barrier(MPI_COMM_WORLD);
+	}
+
+	sdRuntimeMap = sqrt(sdRuntimeMap / (repeat - 1));
+	sdRuntimeRed = sqrt(sdRuntimeRed / (repeat - 1));
+	sdRuntime = sqrt(sdRuntime / (repeat - 1));
+
+	//printf("Processes\t= %d\n", config.size);
+	if(config.rank == MASTER) {
+		printf("\nTotal time\t\t= %fs ± %fs\n", avgRuntime, sdRuntime);
+		printf("Map time\t\t= %fs ± %fs\n", avgRuntimeMap, sdRuntimeMap);
+		printf("Reduction time\t= %fs ± %fs\n", avgRuntimeRed, sdRuntimeRed);
+	}
 
 	MPI_Finalize();	// signal end of MPI
 	return 0;		// exit program
@@ -55,52 +103,38 @@ void init()
 {
 	/* init variables */
 	int i;
-	int chunksForRanks[config.rankSize];
-	int offsets[config.rankSize];
 
 	/* open file for all ranks */
 	MPI_File_open(MPI_COMM_WORLD, config.fInName, MPI_MODE_RDONLY, MPI_INFO_NULL, &config.inFile);
-
-	/* master rank calculates nr of chunks and offsets for all ranks */
-	if(config.rank == MASTER) {
-		
-		MPI_Offset fileSize;			// variable to hold file size
-		MPI_File_get_size(config.inFile, &fileSize);	// read file size in bytes
-		
-		/* total nr of chunks */
-		int chunks = (fileSize / CHUNK) + (fileSize % CHUNK > 0 ? 1 : 0);	
-		int chunksPerRank = chunks / config.rankSize;	// chunks for all ranks
-		int extraChunks = chunks % config.rankSize;		// chunks for some ranks
-		int lastOffset = 0;								// offsets for last rank
-		offsets[0] = 0;									// set offset for first rank to 0	
-
-		/* for all ranks, calculate offsets and nr of chunks */
-		for(i = 0; i < config.rankSize; i++) {
-			chunksForRanks[i] = chunksPerRank;	// chunksPerRank of chunks for all ranks
-			
-			/* if not the last rank */
-			if(i < config.rankSize - 1) {
-				offsets[i + 1] = sizeof(char) * (lastOffset + (chunksPerRank * CHUNK));	// set offset for next rank
-
-				/* if there are still extra chunks to be distributed */
-				if(extraChunks > 0) {
-					chunksForRanks[i]++;			// give extra chunk to this rank
-					offsets[i + 1] += sizeof(char) * CHUNK;	// change offset for next rank by chunk size
-					extraChunks--;				// remove one extra chunk from counter
-				}	
 	
-				lastOffset = offsets[i + 1];		// sets prev offset to the next ranks offset
-			}
+	MPI_Aint bytesPerChunk = CHUNK * sizeof(char);
+	MPI_Aint bytesPerReadAll = config.rankSize * bytesPerChunk;
+	MPI_Offset offset = config.rank * bytesPerChunk;
+	
+	MPI_Datatype contig, filetype;
+	MPI_Type_contiguous(CHUNK, MPI_CHAR, &contig);
+	MPI_Type_create_resized(contig, 0, bytesPerReadAll, &filetype);
+	MPI_Type_commit(&filetype);
+	
+	MPI_File_set_view(config.inFile, offset, MPI_CHAR, filetype, "native", MPI_INFO_NULL);
+	
+	MPI_Offset fileSize;							// variable to hold file size
+	MPI_File_get_size(config.inFile, &fileSize);	// read file size in bytes
+	//printf("rank: %d file size: %lld\n", config.rank, fileSize);
+	
+	int extraRead = (fileSize % bytesPerReadAll) ? 1 : 0;
+	config.fileReads = (unsigned long long) ((fileSize / bytesPerReadAll) + extraRead);
+	
+	if(extraRead) {
+		int fullLastChunks = (fileSize % bytesPerReadAll) / (sizeof(char) * CHUNK);
+		if(config.rank < fullLastChunks) {
+			config.lastRead = CHUNK;
+		} else if(config.rank == fullLastChunks) {
+			config.lastRead = (fileSize % bytesPerReadAll) % (sizeof(char) * CHUNK);
+		} else {
+			config.lastRead = 0;
 		}
 	}
-
-	/* Broadcast the nr of chunks and offsets to all ranks */
-	MPI_Bcast(chunksForRanks, config.rankSize, MPI_INT, MASTER, MPI_COMM_WORLD);
-	MPI_Bcast(offsets, config.rankSize, MPI_INT, MASTER, MPI_COMM_WORLD);
-
-	/* save individual values to the config structs */
-	config.nrOfChunks = chunksForRanks[config.rank];
-	config.offset = offsets[config.rank];
 
 	/* construct the hash table to be used when reading chunks */
 	config.table = construct(config.table);
@@ -125,70 +159,71 @@ void init()
 	MPI_Type_commit(&config.MPI_WORD);
 	
 	// TODO: remove this later
-	printf("rank: %d, chunks: %d, offset: %d\n", config.rank, config.nrOfChunks, config.offset);
+	//printf("rank: %d, fileReads: %lld\n", config.rank, config.fileReads);
 }
 
 void wordCount() 
 {
-	int i, j;
-	bucket* buckPnt = NULL;
-	char* chunkBuff = (char*)malloc(CHUNK * sizeof(char));			// chunk buffer
-	char* wordBuff = (char*)malloc((MAX_WORD + 1) * sizeof(char));	// word buffer
-	char* charBuff = (char*)malloc(sizeof(char));					// char buffer, set at length 1
-	int wPoint = 0;	// pointer to word buffer
+	int wPoint;
+	unsigned long long i, j;
+	bool newWord;
+	bucket *buckPnt = NULL;
+	char chunkBuff[CHUNK]; 			// chunk buffer
+	char wordBuff[MAX_WORD + 1]; 	// word buffer
+	char charBuff[1]; 				// char buffer
 	
-	// TODO: could possibly be done with open_mp?
-	for(i = 0; i < config.nrOfChunks; i++) {
-
-		/* read a chunk from the input file into the chunk buffer. */
-		MPI_File_read_at_all(config.inFile, config.offset + (i*CHUNK), chunkBuff, CHUNK, MPI_CHAR, MPI_STATUS_IGNORE);
-	
-		for(j = 0; j < CHUNK; j++) {		// for each character in the chunk
-			charBuff[0] = chunkBuff[j];		// load character from chunk into char buffer
+	#pragma omp parallel 
+	{
+		unsigned long long chunkLength = CHUNK;
+		
+		#pragma omp for private(i, j, buckPnt, wPoint, chunkBuff, wordBuff, charBuff, newWord)
+		for(i = 0; i < config.fileReads; i++) {
 			
-			// TODO: Make sure that the last rank does not read past end of file
-			if(*charBuff == EOF) {
-				printf("REACHED END!!!\n");
-				goto end; 			// if eof go to end (double break out of for loops)
-			}
-
-			/* if character matches and we can add char */
-			if(*charBuff >= 'a' && *charBuff <= 'z' && wPoint < MAX_WORD) {
-				wordBuff[wPoint] = *charBuff;	// put character into word buffer
-				wPoint++;			// increase word buffer pointer
-			}
-
-			/* if the character does not match, or if the word buffer is full */
-			if(((*charBuff < 'a' || *charBuff > 'z') && wPoint > 0) || wPoint == MAX_WORD) {	
-				wordBuff[wPoint] = '\0';				// mark end of word
-				bool newWord = addString(config.table, wordBuff, &buckPnt);	// add to hashTable
-				wPoint = 0;						// reset word pointer
+			// read a chunk from the input file into the chunk buffer.
+			#pragma omp critical(fileRead)
+			MPI_File_read_all(config.inFile, chunkBuff, CHUNK, MPI_CHAR, MPI_STATUS_IGNORE);
+			
+			wPoint = 0;
+			
+			if(i == config.fileReads - 1) chunkLength = config.lastRead;
+			
+			for(j = 0; j < chunkLength; j++) {	// for each character in the chunk
+				charBuff[0] = chunkBuff[j];		// load character from chunk into char buffer
 				
-				if(newWord) {
-					int toRank = (int) hash((unsigned char*)wordBuff, config.rankSize);
-					config.sendCounters[toRank]++;
+				// if character matches and we can add char 
+				if(*charBuff >= 'a' && *charBuff <= 'z' && wPoint < MAX_WORD) {
+					wordBuff[wPoint] = *charBuff;	// put character into word buffer
+					wPoint++;						// increase word buffer pointer
+				}
+				
+				// if the character does not match, or if the word buffer is full
+				if(((*charBuff < 'a' || *charBuff > 'z') && wPoint > 0) || wPoint == MAX_WORD) {	
+					wordBuff[wPoint] = '\0';	// mark end of word
+					
+					#pragma omp critical(addToHashTable)
+					newWord = addString(config.table, wordBuff, &buckPnt);	// add to hashTable
+					wPoint = 0;												// reset word pointer
+					
+					if(newWord) {
+						int toRank = (int) hash((unsigned char*)wordBuff, config.rankSize);
+						#pragma omp atomic
+						config.sendCounters[toRank]++;
+					}
 				}
 			}
 		}
+
+		//printf("rank %d stored words: %d\n", config.rank, config.table->size);
 	}
 	
-	/* end label, will go here if end of file is reached */
-	end:	
-	
-	MPI_Barrier(MPI_COMM_WORLD);
-	//printf("rank %d stored words: %d\n", config.rank, config.table->size);
-
-	free(chunkBuff);
-	free(wordBuff);
-	free(charBuff);	
 	MPI_File_close(&config.inFile);
 }
 
 void reduce() 
 {
 	int i;
-	int* sendRecvBuff = (int*) malloc(config.rankSize * sizeof(int));
-	int* pointMem = sendRecvBuff;
+	int *sendRecvBuff = (int*) malloc(config.rankSize * sizeof(int));
+	int *pointMem = sendRecvBuff;
 
 	toVectors(config.table, config.sendVectors, config.rankSize);
 
@@ -203,7 +238,7 @@ void reduce()
 	
 	free(sendRecvBuff);
 
-	word* recvBuff[config.rankSize];
+	word *recvBuff[config.rankSize];
 	int recieves = 0;
 
 	for (i = 0; i < config.rankSize; i++) {
@@ -233,9 +268,9 @@ void reduce()
 	MPI_Waitall(recieves, requests, MPI_STATUS_IGNORE);
 	int j;
 	
-	for(i = 0; i < config.rankSize; i++) {
-		if(i == config.rank) continue;
-		
+	config.recvCounters[config.rank] = 0;
+	
+	for(i = 0; i < config.rankSize; i++) {	
 		for(j = 0; j < config.recvCounters[i]; j++) {
 			addWord(config.finalTable, &recvBuff[i][j]);
 		}
@@ -245,7 +280,7 @@ void reduce()
 		addWord(config.finalTable, &config.sendVectors[config.rank].data[i]);
 	}
 	
-	hashTablePrint(config.finalTable);
+	//hashTablePrint(config.finalTable);
 }
 
 void error(int errCode, int line) 
