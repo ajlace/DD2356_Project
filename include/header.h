@@ -14,7 +14,7 @@ typedef struct vector vector;
 
 #define MAX_WORD 15
 #define MASTER 0
-#define CHUNK 64000000ULL
+#define CHUNK 67108864ULL
 #define USAGE_ERR 1
 #define REALLOC_ERR 2
 #define REPEAT 10
