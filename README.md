@@ -1,9 +1,16 @@
 # DD2356_Project
 
-TODO:
+## Git structure:
+* master branch: MPI implementation with non-blocking communication
+* collective branch: MPI Collective I/O implementation with non-blocking point-to-point communication
+* omp branch: MPI Collective I/O OpenMP implementation with non-blocking point-to-point communication
 
-* Find where we need to place timers
-* Decide what should be meausered
-* Fix the makefile for Beskow
-* Fix comms to ranks neccessary for file reading
-* Eventually fix the klipping of words in the file
+## Beskow set up:
+* Change the amount of repetitions in main.c
+* module swap PrgEnv-xxx PrgEnv-gnu
+* compile using Makefile
+
+### Run on beskow:
+* MPI: aprun -n X ./mapRed.out -f <fileName>
+* Collective: aprun -n X ./mapRedCollective.out -f <fileName>
+* OpenMP: aprun -n X ./mapRedOmp.out -f <fileName>
