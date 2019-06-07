@@ -2,11 +2,13 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <mpi.h>
+#include <math.h>
 
 #include "header.h"
 
 struct Config {
-	int rank, rankSize, offset, nrOfChunks;
+	int rank, rankSize;
+	unsigned long long offset, nrOfChunks;
 	int* sendCounters;
 	int* recvCounters;
 	char* fInName;
@@ -21,7 +23,12 @@ struct Config config;
 
 int main(int argc, char* argv[])
 {
-	int opt;
+	int opt, i;
+	int repeat = 1;
+	double startTime, endTime, runtimeMap, runtimeRed, runtime;
+	double avgRuntime = 0.0, 	prevAvgRuntime = 0.0, 	 sdRuntime = 0.0;
+	double avgRuntimeMap = 0.0, prevAvgRuntimeMap = 0.0, sdRuntimeMap = 0.0;
+	double avgRuntimeRed = 0.0, prevAvgRuntimeRed = 0.0, sdRuntimeRed = 0.0;
 
 	MPI_Init(&argc, &argv);
 	MPI_Comm_rank(MPI_COMM_WORLD, &config.rank);
@@ -42,10 +49,52 @@ int main(int argc, char* argv[])
 		}
 	}
 	
-	init();			// init all values
-	wordCount();	// do word count for input file
-	reduce();		// redistribute and reduce
-	cleanup();		// free all resources
+	for(i = 0; i < repeat; i++) {
+		init();			// init all values
+		MPI_Barrier(MPI_COMM_WORLD);
+		
+		startTime = MPI_Wtime();
+		wordCount();	// do word count for input file
+		MPI_Barrier(MPI_COMM_WORLD);
+		endTime = MPI_Wtime();
+				
+		runtimeMap = endTime - startTime;
+		prevAvgRuntimeMap = avgRuntimeMap;
+		avgRuntimeMap = avgRuntimeMap + (runtimeMap - avgRuntimeMap) / (i + 1);
+		sdRuntimeMap = sdRuntimeMap + (runtimeMap - avgRuntimeMap) * (runtimeMap - prevAvgRuntimeMap);
+		
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		startTime = MPI_Wtime();
+		reduce();		// redistribute and reduce
+		MPI_Barrier(MPI_COMM_WORLD);
+		endTime = MPI_Wtime();
+		
+		runtimeRed = endTime - startTime;
+		prevAvgRuntimeRed = avgRuntimeRed;
+		avgRuntimeRed = avgRuntimeRed + (runtimeRed - avgRuntimeRed) / (i + 1);
+		sdRuntimeRed = sdRuntimeRed + (runtimeRed - avgRuntimeRed) * (runtimeRed - prevAvgRuntimeRed);
+				
+		cleanup();		// free all resources
+		
+		runtime = runtimeMap + runtimeRed;
+		prevAvgRuntime = avgRuntime;
+		avgRuntime = avgRuntime + (runtime - avgRuntime) / (i + 1);
+		sdRuntime = sdRuntime + (runtime - avgRuntime) * (runtime - prevAvgRuntime);
+		
+		MPI_Barrier(MPI_COMM_WORLD);
+	}
+
+	sdRuntimeMap = sqrt(sdRuntimeMap / (repeat - 1));
+	sdRuntimeRed = sqrt(sdRuntimeRed / (repeat - 1));
+	sdRuntime = sqrt(sdRuntime / (repeat - 1));
+
+	//printf("Processes\t= %d\n", config.size);
+	if(config.rank == MASTER) {
+		printf("Duration\t\t= %fs ± %fs\n", avgRuntime, sdRuntime);
+		printf("Map duration\t\t= %fs ± %fs\n", avgRuntimeMap, sdRuntimeMap);
+		printf("Reduction duration\t= %fs ± %fs\n", avgRuntimeRed, sdRuntimeRed);
+	}
 
 	MPI_Finalize();	// signal end of MPI
 	return 0;		// exit program
@@ -55,8 +104,8 @@ void init()
 {
 	/* init variables */
 	int i;
-	int chunksForRanks[config.rankSize];
-	int offsets[config.rankSize];
+	unsigned long long chunksForRanks[config.rankSize];
+	unsigned long long offsets[config.rankSize];
 
 	/* open file for all ranks */
 	MPI_File_open(MPI_COMM_WORLD, config.fInName, MPI_MODE_RDONLY, MPI_INFO_NULL, &config.inFile);
@@ -64,15 +113,16 @@ void init()
 	/* master rank calculates nr of chunks and offsets for all ranks */
 	if(config.rank == MASTER) {
 		
-		MPI_Offset fileSize;			// variable to hold file size
+		MPI_Offset fileSize;							// variable to hold file size
 		MPI_File_get_size(config.inFile, &fileSize);	// read file size in bytes
+		//printf("File size: %llu\n", (unsigned long long) fileSize);
 		
 		/* total nr of chunks */
-		int chunks = (fileSize / CHUNK) + (fileSize % CHUNK > 0 ? 1 : 0);	
-		int chunksPerRank = chunks / config.rankSize;	// chunks for all ranks
-		int extraChunks = chunks % config.rankSize;		// chunks for some ranks
-		int lastOffset = 0;								// offsets for last rank
-		offsets[0] = 0;									// set offset for first rank to 0	
+		unsigned long long chunks = (fileSize / CHUNK) + (fileSize % CHUNK > 0 ? 1 : 0);	
+		unsigned long long chunksPerRank = chunks / config.rankSize;	// chunks for all ranks
+		unsigned long long extraChunks = chunks % config.rankSize;		// chunks for some ranks
+		unsigned long long lastOffset = 0;								// offsets for last rank
+		offsets[0] = 0;													// offset for first is 0	
 
 		/* for all ranks, calculate offsets and nr of chunks */
 		for(i = 0; i < config.rankSize; i++) {
@@ -95,8 +145,8 @@ void init()
 	}
 
 	/* Broadcast the nr of chunks and offsets to all ranks */
-	MPI_Bcast(chunksForRanks, config.rankSize, MPI_INT, MASTER, MPI_COMM_WORLD);
-	MPI_Bcast(offsets, config.rankSize, MPI_INT, MASTER, MPI_COMM_WORLD);
+	MPI_Bcast(chunksForRanks, config.rankSize, MPI_UNSIGNED_LONG_LONG, MASTER, MPI_COMM_WORLD);
+	MPI_Bcast(offsets, config.rankSize, MPI_UNSIGNED_LONG_LONG, MASTER, MPI_COMM_WORLD);
 
 	/* save individual values to the config structs */
 	config.nrOfChunks = chunksForRanks[config.rank];
@@ -125,7 +175,7 @@ void init()
 	MPI_Type_commit(&config.MPI_WORD);
 	
 	// TODO: remove this later
-	printf("rank: %d, chunks: %d, offset: %d\n", config.rank, config.nrOfChunks, config.offset);
+	//printf("rank: %d, chunks: %d, offset: %d\n", config.rank, config.nrOfChunks, config.offset);
 }
 
 void wordCount() 
@@ -141,7 +191,7 @@ void wordCount()
 	for(i = 0; i < config.nrOfChunks; i++) {
 
 		/* read a chunk from the input file into the chunk buffer. */
-		MPI_File_read_at_all(config.inFile, config.offset + (i*CHUNK), chunkBuff, CHUNK, MPI_CHAR, MPI_STATUS_IGNORE);
+		MPI_File_read_at(config.inFile, config.offset + (i*CHUNK), chunkBuff, CHUNK, MPI_CHAR, MPI_STATUS_IGNORE);
 	
 		for(j = 0; j < CHUNK; j++) {		// for each character in the chunk
 			charBuff[0] = chunkBuff[j];		// load character from chunk into char buffer
@@ -175,7 +225,6 @@ void wordCount()
 	/* end label, will go here if end of file is reached */
 	end:	
 	
-	MPI_Barrier(MPI_COMM_WORLD);
 	//printf("rank %d stored words: %d\n", config.rank, config.table->size);
 
 	free(chunkBuff);
